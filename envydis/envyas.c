@@ -24,6 +24,7 @@
 
 #include "envyas.h"
 #include "symtab.h"
+#include "sched-intern.h"
 #include <libgen.h>
 #include <stdlib.h>
 #include <string.h>
@@ -176,6 +177,11 @@ int resolve (struct asctx *ctx, ull *val, struct match m, ull pos) {
 	return 1;
 }
 
+struct sched {
+	int begin;
+	int size;
+};
+
 struct section {
 	const char *name;
 	ull base;
@@ -183,6 +189,9 @@ struct section {
 	int pos;
 	int maxpos;
 	int first_label, last_label;
+	struct sched *sched;
+	int schednum;
+	int schedmax;
 };
 
 void extend(struct section *s, int add) {
@@ -277,10 +286,15 @@ int envyas_layout(struct asctx *ctx, struct easm_file *file) {
 		struct section def = { "default" };
 		def.first_label = -1;
 		ADDARRAY(ctx->sections, def);
+		struct sched cursched = { -1, -1 };
 		for (i = 0; i < file->linesnum; i++) {
 			struct easm_directive *direct = file->lines[i]->directive;
 			switch (file->lines[i]->type) {
 				case EASM_LINE_INSN:
+					/* make room for scheduling instructions */
+					if (cursched.begin != -1)
+						ctx->isa->schedtarg->inssched(&ctx->sections[cursect].pos, NULL);
+
 					if (ctx->isa->i_need_g80as_hack) {
 						if (ctx->im[i].m[0].oplen == 8 && (ctx->sections[cursect].pos & 7))
 							ctx->sections[cursect].pos &= ~7ull, ctx->sections[cursect].pos += 8;
@@ -385,6 +399,41 @@ int envyas_layout(struct asctx *ctx, struct easm_file *file) {
 						}
 						struct label l = { direct->params[0]->str, num , /* Distinguish .equ labels from regular labels */ 1 };
 						ADDARRAY(ctx->labels, l);
+					} else if (!strcmp(direct->str, "beginsched")) {
+						if (direct->paramsnum > 0) {
+							fprintf (stderr, LOC_FORMAT(direct->loc, "Too many arguments for .beginsched\n"));
+							return 1;
+						}
+						if (cursched.begin != -1) {
+							fprintf (stderr, LOC_FORMAT(file->lines[i]->loc, "Scheduling already begun\n"));
+							return 1;
+						}
+						if (ctx->sections[cursect].pos % 8 != 0) {
+							fprintf (stderr, LOC_FORMAT(file->lines[i]->loc, "Scheduling must begin at a 8-byte aligned position within the section\n"));
+							return 1;
+						}
+						if (!ctx->isa->schedtarg) {
+							fprintf(stderr, "Unsupported ISA for scheduling\n");
+							return 1;
+						}
+						cursched.begin = 0; /* not a correct value, but it's not -1 */
+					} else if (!strcmp(direct->str, "endsched")) {
+						if (direct->paramsnum > 0) {
+							fprintf (stderr, LOC_FORMAT(direct->loc, "Too many arguments for .endsched\n"));
+							return 1;
+						}
+						if (cursched.begin == -1) {
+							fprintf (stderr, LOC_FORMAT(file->lines[i]->loc, "Scheduling not started\n"));
+							return 1;
+						}
+						if (ctx->sections[cursect].pos % 8 != 0) {
+							fprintf (stderr, LOC_FORMAT(file->lines[i]->loc, "Scheduling must end at a 8-byte aligned position within the section\n"));
+							return 1;
+						}
+						/* insert nops */
+						while (cursched.begin != -1 && ctx->isa->schedtarg->inspaddingnop(&ctx->sections[cursect].pos, NULL))
+							;
+						cursched.begin = -1;
 					} else if (!donum(&ctx->sections[cursect], direct, ctx, 0)) {
 						fprintf (stderr, LOC_FORMAT(direct->loc, "Unknown directive .%s\n"), direct->str);
 						return 1;
@@ -401,6 +450,11 @@ int envyas_layout(struct asctx *ctx, struct easm_file *file) {
 			struct easm_directive *direct = file->lines[i]->directive;
 			switch (file->lines[i]->type) {
 				case EASM_LINE_INSN:
+					if (cursched.begin != -1) {
+						extend(&ctx->sections[cursect], ctx->isa->schedtarg->inssched(NULL, NULL));
+						ctx->isa->schedtarg->inssched(&ctx->sections[cursect].pos, ctx->sections[cursect].code);
+					}
+
 					if (!resolve(ctx, val, ctx->im[i].m[0], ctx->sections[cursect].pos / stride + ctx->sections[cursect].base)) {
 						ctx->sections[cursect].pos += ctx->im[i].m[0].oplen * stride;
 						ctx->im[i].m++;
@@ -436,6 +490,10 @@ int envyas_layout(struct asctx *ctx, struct easm_file *file) {
 					break;
 				case EASM_LINE_DIRECTIVE:
 					if (!strcmp(direct->str, "section")) {
+						if (cursched.begin != -1) {
+							fprintf (stderr, LOC_FORMAT(file->lines[i]->loc, "Scheduling must end before beginning a new section\n"));
+							return 1;
+						}
 						for (j = 0; j < ctx->sectionsnum; j++)
 							if (!strcmp(ctx->sections[j].name, direct->params[0]->str))
 								break;
@@ -469,6 +527,18 @@ int envyas_layout(struct asctx *ctx, struct easm_file *file) {
 							ctx->sections[cursect].code[j] = 0;
 					} else if (!strcmp(direct->str, "equ")) {
 						/* nothing to be done */
+					} else if (!strcmp(file->lines[i]->directive->str, "beginsched")) {
+						cursched.begin = ctx->sections[cursect].pos / 8;
+					} else if (!strcmp(file->lines[i]->directive->str, "endsched")) {
+						/* insert nops */
+						while (cursched.begin != -1) {
+							extend(&ctx->sections[cursect], ctx->isa->schedtarg->inspaddingnop(NULL, NULL));
+							if (!ctx->isa->schedtarg->inspaddingnop(&ctx->sections[cursect].pos, ctx->sections[cursect].code))
+								break;
+						}
+						cursched.size = (ctx->sections[cursect].pos / 8 - cursched.begin);
+						ADDARRAY(ctx->sections[cursect].sched, cursched);
+						cursched.begin = -1;
 					} else if (!donum(&ctx->sections[cursect], direct, ctx, 1)) {
 						fprintf (stderr, LOC_FORMAT(direct->loc, "Unknown directive .%s\n"), direct->str);
 						return 1;
@@ -476,6 +546,19 @@ int envyas_layout(struct asctx *ctx, struct easm_file *file) {
 			}
 		}
 	} while (!allok);
+	return 0;
+}
+
+static int sched_section(const struct asctx *ctx, struct section *section) {
+	int i;
+	for (i = 0; i < section->schednum; i++) {
+		uint64_t *code = (uint64_t*)section->code + section->sched[i].begin;
+		if (do_sched(ctx->isa, section->sched[i].size, code)) {
+			fprintf(stderr, "Failed to schedule instructions\n");
+			return 1;
+		}
+	}
+
 	return 0;
 }
 
@@ -498,6 +581,8 @@ int envyas_output(struct asctx *ctx, enum envyas_ofmt ofmt, const char *outname,
 	for (i = 0; i < ctx->sectionsnum; i++) {
 		if (!strcmp(ctx->sections[i].name, "default") && !ctx->sections[i].pos)
 			continue;
+		if (sched_section(ctx, &ctx->sections[i]))
+			return 1;
 		if (ofmt == OFMT_RAW) {
 			for (j = 0; j < ctx->sections[i].pos; j += cbsz) {
 				fwrite (ctx->sections[i].code + j, 1, cbsz, outfile);

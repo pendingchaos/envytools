@@ -53,4 +53,6 @@ ull getrbf_as(const struct rbitfield *bf, ull *a, ull *m, ull cpos);
 
 struct matches *do_as(const struct disisa *isa, struct varinfo *varinfo, struct easm_insn *insn);
 
+int do_sched(const struct disisa *isa, unsigned funcsize, uint64_t *func);
+
 #endif

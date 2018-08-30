@@ -44,6 +44,7 @@ struct disisa {
 	struct insn *trootas;
 	struct insn *tsched;
 	int schedpos;
+	struct schedtarget *schedtarg;
 };
 
 struct label {
